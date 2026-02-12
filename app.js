@@ -3,10 +3,43 @@ const PORT = 3000;
 import { pool } from "./db.js"
 import express from 'express'
 import dotenv from 'dotenv'
+import { GoogleGenerativeAI } from '@google/generative-ai'
+
 dotenv.config()
+
+const genAI = process.env.GEMINI_API_KEY
+  ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+  : null;
 
 const app = express()
 app.use(express.json())
+
+// Optional: get cycle context for the health assistant (profile id, default 3)
+async function getCycleContext(profileId = 3) {
+  try {
+    const { rows } = await pool.query(
+      'SELECT lastperiod, avgcyclelength FROM profiles WHERE id = $1',
+      [profileId]
+    );
+    if (!rows[0]) return null;
+    const { lastperiod, avgcyclelength } = rows[0];
+    const today = new Date();
+    const lastPeriod = new Date(lastperiod);
+    const daysPast = Math.floor((today - lastPeriod) / (1000 * 60 * 60 * 24));
+    const currentDay = (daysPast % avgcyclelength) + 1;
+    const ovulationDay = avgcyclelength < 21
+      ? Math.floor(avgcyclelength / 2)
+      : avgcyclelength - 14;
+    let phase = 'Unknown';
+    if (currentDay <= 5) phase = 'Menses';
+    else if (currentDay < ovulationDay - 2) phase = 'Follicular';
+    else if (currentDay >= ovulationDay - 2 && currentDay <= ovulationDay + 1) phase = 'Ovulation';
+    else phase = 'Luteal';
+    return { currentDay, phase, avgcyclelength };
+  } catch {
+    return null;
+  }
+}
 
 
 app.get("/api", (req,res)=> {
@@ -28,9 +61,9 @@ app.get('/api/period', async (req,res)=> {
         // math to calculate phase 
         // if period shorter than 20 days we treat it as a short cycle
         if (results.avgcyclelength < 21) {
-            ovulation = Math.floor(avgcyclelength / 2)
+            ovulation = Math.floor(results.avgcyclelength / 2)
         } else {
-            ovulation = avgcyclelength - 14;
+            ovulation = results.avgcyclelength - 14;
         }
 
        if (currentDay <= 5) { 
@@ -100,7 +133,7 @@ app.get('/api/predictions', async (req, res) => {
     try {
         const queryToGetInfo = 'SELECT lastperiod, avgcyclelength FROM profiles WHERE id = 3'
         const results = await pool.query(queryToGetInfo);
-        const { lastperiod, avgcyclelength } = raw.rows[0];
+        const { lastperiod, avgcyclelength } = results.rows[0];
 
         let predictions = [];
         let nextDate = new Date(lastperiod);
@@ -129,7 +162,7 @@ app.put("/api/update-period", async (req, res) => {
         const today = new Date().toISOString().split('T')[0]; // Format: YYYY-MM-DD
 
         const updateQuery = "UPDATE profiles SET lastperiod = $1 WHERE id = 3";
-        await pool.query(updateQuery, [today, userId]);
+        await pool.query(updateQuery, [today]);
 
         res.json({ 
             message: "Cycle updated Day 1 is now " + today,
@@ -138,5 +171,42 @@ app.put("/api/update-period", async (req, res) => {
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: "Failed to update cycle" });
+    }
+});
+
+// Gemini health assistant 
+app.post('/api/assistant', async (req, res) => {
+    try {
+        if (!genAI) {
+            return res.status(503).json({
+                error: 'Health assistant is not configured. Set GEMINI_API_KEY in .env.',
+            });
+        }
+        const { message, profileId = 3 } = req.body;
+        if (!message || typeof message !== 'string') {
+            return res.status(400).json({ error: 'Please provide a non-empty "message" in the request body.' });
+        }
+        const cycleContext = await getCycleContext(profileId);
+        const contextStr = cycleContext
+            ? `The user is on day ${cycleContext.currentDay} of their cycle (phase: ${cycleContext.phase}, average cycle length: ${cycleContext.avgcyclelength} days).`
+            : 'No cycle data is available for this user.';
+        const systemInstruction = `You are a supportive, respectful health assistant for a period/cycle tracking app. You can discuss cycles, symptoms, wellness, and general health tips. Always remind users you are not a doctor and they should see a healthcare provider for medical advice. Be concise and helpful. Current user context: ${contextStr}`;
+        const model = genAI.getGenerativeModel({
+            model: 'gemini-2.0-flash',
+            systemInstruction,
+        });
+        const result = await model.generateContent(message.trim());
+        const response = result.response;
+        const text = response.text();
+        if (!text) {
+            return res.status(502).json({ error: 'Assistant did not return a reply.' });
+        }
+        res.json({ reply: text });
+    } catch (err) {
+        console.error('Assistant error:', err);
+        res.status(500).json({
+            error: 'The health assistant could not process your message.',
+            details: process.env.NODE_ENV === 'development' ? err.message : undefined,
+        });
     }
 });
