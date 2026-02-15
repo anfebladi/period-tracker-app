@@ -14,33 +14,54 @@ const genAI = process.env.GEMINI_API_KEY
 const app = express()
 app.use(express.json())
 
-// Optional: get cycle context for the health assistant (profile id, default 3)
-async function getCycleContext(profileId = 3) {
+import { DateTime } from 'luxon';
+
+async function getCycleContext(profileId) {
   try {
-    const { rows } = await pool.query(
-      'SELECT lastperiod, avgcyclelength FROM profiles WHERE id = $1',
-      [profileId]
-    );
-    if (!rows[0]) return null;
-    const { lastperiod, avgcyclelength } = rows[0];
-    const today = new Date();
-    const lastPeriod = new Date(lastperiod);
-    const daysPast = Math.floor((today - lastPeriod) / (1000 * 60 * 60 * 24));
-    const currentDay = (daysPast % avgcyclelength) + 1;
-    const ovulationDay = avgcyclelength < 21
-      ? Math.floor(avgcyclelength / 2)
-      : avgcyclelength - 14;
-    let phase = 'Unknown';
-    if (currentDay <= 5) phase = 'Menses';
-    else if (currentDay < ovulationDay - 2) phase = 'Follicular';
-    else if (currentDay >= ovulationDay - 2 && currentDay <= ovulationDay + 1) phase = 'Ovulation';
-    else phase = 'Luteal';
-    return { currentDay, phase, avgcyclelength };
-  } catch {
+    const query = `
+      SELECT p.avgcyclelength, pd.startdate 
+      FROM profiles p 
+      JOIN period pd ON p.id = pd.userid 
+      WHERE p.id = $1 
+      ORDER BY pd.startdate DESC LIMIT 1
+    `;
+    const { rows } = await pool.query(query, [profileId]);
+    
+    if (!rows[0] || !rows[0].startdate) return null;
+
+    const { startdate, avgcyclelength } = rows[0];
+    const cycleLength = parseInt(avgcyclelength) || 28;
+    
+    
+    const today = DateTime.now().startOf('day');
+    const startDate = DateTime.fromJSDate(startdate).startOf('day');
+    
+    
+    const diff = Math.floor(today.diff(startDate, 'days').days);
+    
+    
+    const currentDay = ((diff % cycleLength) + cycleLength) % cycleLength + 1;
+
+    
+    let phase;
+    const ovulationDay = cycleLength - 14; 
+
+    if (currentDay <= 5) { 
+        phase = "Menses";
+    } else if (currentDay < ovulationDay - 2) {
+        phase = "Follicular";
+    } else if (currentDay >= ovulationDay - 2 && currentDay <= ovulationDay + 1) {
+        phase = "Ovulation";
+    } else {
+        phase = "Luteal";
+    }
+
+    return { currentDay, phase, avgcyclelength: cycleLength };
+  } catch (err) {
+    console.error("Context Error:", err);
     return null;
   }
 }
-
 
 // first time logging in
 import { v4 as uuidv4 } from 'uuid';
@@ -81,7 +102,8 @@ app.get("/api", (req,res)=> {
 
 
 // get your status + current date
-// im having a lot of issues with the timezone migth need to use a library for this or sum
+
+
 app.get('/api/period', checkAuth, async (req, res) => {
     try {
         const getPeriodQuery = `
@@ -95,22 +117,23 @@ app.get('/api/period', checkAuth, async (req, res) => {
         const raw = await pool.query(getPeriodQuery, [req.userId]);
         
         if (raw.rows.length === 0) {
-            return res.status(404).json({ error: "No active cycle found (enddate is not null)." });
+            return res.status(404).json({ error: "No active cycle found." });
         }
 
         const results = raw.rows[0];
         const cycleLength = parseInt(results.avgcyclelength) || 28;
 
-        const now = new Date();
-        const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    
+        const today = DateTime.now().startOf('day'); 
 
-        const startDateObj = new Date(results.startdate);
-        const startUTC = Date.UTC(startDateObj.getUTCFullYear(), startDateObj.getUTCMonth(), startDateObj.getUTCDate());
+        
+        const startDate = DateTime.fromJSDate(results.startdate).startOf('day');
 
-        const diffInMs = todayUTC - startUTC;
-        const daysPast = Math.floor(diffInMs / (1000 * 60 * 60 * 24));
+ 
+        const diff = today.diff(startDate, 'days').days;
+        const daysPast = Math.floor(diff);
 
-      
+        
         const currentDay = ((daysPast % cycleLength) + cycleLength) % cycleLength + 1;
 
         let phase;
@@ -128,7 +151,8 @@ app.get('/api/period', checkAuth, async (req, res) => {
 
         res.json({ 
             day_in_cycle: currentDay, 
-            phase: phase 
+            phase: phase,
+            days_since_start: daysPast 
         });
 
     } catch (err) {
@@ -160,6 +184,8 @@ app.post("/api/logger", checkAuth, async (req, res) => {
 
 //next 6 periods predictor
 // call this endpoint for calendar
+
+
 app.get('/api/predictions', checkAuth, async (req, res) => {
     try {
         const queryToGetInfo = `
@@ -177,18 +203,24 @@ app.get('/api/predictions', checkAuth, async (req, res) => {
         }
 
         const { startdate, avgcyclelength } = results.rows[0];
+        const cycleLength = parseInt(avgcyclelength) || 28;
+        
         let predictions = [];
-        let currentRefDate = new Date(startdate);
+        
+    
+        let baseDate = DateTime.fromJSDate(startdate).startOf('day');
 
-        for (let i = 0; i < 6; i++) {
-            currentRefDate.setDate(currentRefDate.getDate() + avgcyclelength);
-            let endDate = new Date(currentRefDate);
-            endDate.setDate(endDate.getDate() + 5);
+        for (let i = 1; i <= 6; i++) {
+            
+            const predictedStart = baseDate.plus({ days: cycleLength * i });
+            
+           
+            const predictedEnd = predictedStart.plus({ days: 4 }); 
 
             predictions.push({
-                period_number: i + 1,
-                estimated_start: currentRefDate.toISOString().split('T')[0],
-                estimated_end: endDate.toISOString().split('T')[0]
+                period_number: i,
+                estimated_start: predictedStart.toISODate(), 
+                estimated_end: predictedEnd.toISODate()
             });
         }
 
@@ -238,22 +270,26 @@ app.post("/api/first-period", checkAuth, async (req, res) => {
 
 //update new period
 //needs further testing
+
 app.post("/api/new-period", checkAuth, async (req, res) => {
     const client = await pool.connect(); 
     try {
         const { startDate } = req.body; 
-        const todayStr = startDate;
+        
+        
+        const startDt = DateTime.fromISO(startDate);
+        const todayStr = startDt.toISODate(); 
 
         await client.query('BEGIN'); 
+
+        
+        const yesterdayStr = startDt.minus({ days: 1 }).toISODate(); 
 
         const closeQuery = `
             UPDATE period
             SET enddate = $1 
             WHERE userid = $2 AND enddate IS NULL
         `;
-        const yesterday = new Date(todayStr);
-        yesterday.setDate(yesterday.getDate() - 1);
-        const yesterdayStr = yesterday.toISOString().split('T')[0];
         await client.query(closeQuery, [yesterdayStr, req.userId]);
 
         const openQuery = `
@@ -270,17 +306,19 @@ app.post("/api/new-period", checkAuth, async (req, res) => {
         `;
         const history = await client.query(historyQuery, [req.userId]);
 
+
         if (history.rows.length >= 2) {
             let totalDays = 0;
             let count = 0;
 
             for (let i = 0; i < history.rows.length - 1; i++) {
-                const d1 = new Date(history.rows[i].startdate);
-                const d2 = new Date(history.rows[i + 1].startdate);
                 
-             
-                const diff = Math.round((d1 - d2) / (1000 * 60 * 60 * 24));
-                totalDays += diff;
+                const d1 = DateTime.fromJSDate(history.rows[i].startdate);
+                const d2 = DateTime.fromJSDate(history.rows[i + 1].startdate);
+                
+              
+                const diff = d1.diff(d2, 'days').days;
+                totalDays += Math.round(diff);
                 count++;
             }
 
@@ -307,40 +345,52 @@ app.post("/api/new-period", checkAuth, async (req, res) => {
         client.release(); 
     }
 });
+
+//dont know if works yet 
+// api hit the rate limit 
 // Gemini health assistant 
-app.post('/api/assistant', async (req, res) => {
+app.post('/api/assistant', checkAuth, async (req, res) => {
     try {
         if (!genAI) {
             return res.status(503).json({
-                error: 'Health assistant is not configured. Set GEMINI_API_KEY in .env.',
+                error: 'Health assistant is not configured.',
             });
         }
-        const { message, profileId = 3 } = req.body;
+
+        const { message } = req.body; 
+        
         if (!message || typeof message !== 'string') {
-            return res.status(400).json({ error: 'Please provide a non-empty "message" in the request body.' });
+            return res.status(400).json({ error: 'Please provide a message.' });
         }
-        const cycleContext = await getCycleContext(profileId);
+
+        const cycleContext = await getCycleContext(req.userId);
+        
         const contextStr = cycleContext
             ? `The user is on day ${cycleContext.currentDay} of their cycle (phase: ${cycleContext.phase}, average cycle length: ${cycleContext.avgcyclelength} days).`
             : 'No cycle data is available for this user.';
-        const systemInstruction = `You are a supportive, respectful health assistant for a period/cycle tracking app. You can discuss cycles, symptoms, wellness, and general health tips. Always remind users you are not a doctor and they should see a healthcare provider for medical advice. Be concise and helpful. Current user context: ${contextStr}`;
+
+        const systemInstruction = `You are a supportive, respectful health assistant for a period/cycle tracking app. 
+        Current user context: ${contextStr}. 
+        You can discuss cycles, symptoms, wellness, and general health tips. 
+        Always remind users you are not a doctor and they should see a healthcare provider for medical advice. 
+        Be concise and helpful.`;
+
         const model = genAI.getGenerativeModel({
             model: 'gemini-2.0-flash',
             systemInstruction,
         });
+
         const result = await model.generateContent(message.trim());
-        const response = result.response;
-        const text = response.text();
+        const text = result.response.text();
+
         if (!text) {
             return res.status(502).json({ error: 'Assistant did not return a reply.' });
         }
+
         res.json({ reply: text });
     } catch (err) {
         console.error('Assistant error:', err);
-        res.status(500).json({
-            error: 'The health assistant could not process your message.',
-            details: process.env.NODE_ENV === 'development' ? err.message : undefined,
-        });
+        res.status(500).json({ error: 'The health assistant could not process your message.' });
     }
 });
 
@@ -368,6 +418,7 @@ app.get("/api/logs/pdf", checkAuth, async (req, res) => {
                 s.symptomname, 
                 s.severity, 
                 s.logged_at,
+                p.avgcyclelength,
                 (SELECT startdate FROM period 
                  WHERE userid = $1 AND startdate <= s.logged_at 
                  ORDER BY startdate DESC LIMIT 1) as period_start,
@@ -375,6 +426,7 @@ app.get("/api/logs/pdf", checkAuth, async (req, res) => {
                  WHERE userid = $1 AND startdate <= s.logged_at 
                  ORDER BY startdate DESC LIMIT 1) as period_end
             FROM SYMPTOMDECODER s
+            JOIN profiles p ON s.userid = p.id
             WHERE s.userid = $1 
             ORDER BY s.logged_at DESC 
             LIMIT 10
@@ -386,6 +438,7 @@ app.get("/api/logs/pdf", checkAuth, async (req, res) => {
             return res.status(404).send("No symptom logs found.");
         }
 
+        const avgCycle = results.rows[0].avgcyclelength || "Not set";
         const doc = new PDFDocument();
         
         res.setHeader('Content-Type', 'application/pdf');
@@ -393,19 +446,30 @@ app.get("/api/logs/pdf", checkAuth, async (req, res) => {
 
         doc.pipe(res); 
 
-        doc.fontSize(20).text('Symptom Log Report', { align: 'center' });
-        doc.moveDown();
+        
+        doc.fontSize(22).text('Symptom Log Report', { align: 'center' });
+        doc.fontSize(12).text(`Average Cycle Length: ${avgCycle} days`, { align: 'center' });
+        doc.moveDown(2);
 
+        
         results.rows.forEach(log => {
-            const logDate = new Date(log.logged_at).toLocaleDateString();
-            const pStart = log.period_start ? new Date(log.period_start).toLocaleDateString() : "N/A";
-            const pEnd = log.period_end ? new Date(log.period_end).toLocaleDateString() : "Present";
+            
+            const logDate = DateTime.fromJSDate(log.logged_at).toLocaleString(DateTime.DATE_MED);
+            const pStart = log.period_start 
+                ? DateTime.fromJSDate(log.period_start).toLocaleString(DateTime.DATE_MED) 
+                : "N/A";
+            const pEnd = log.period_end 
+                ? DateTime.fromJSDate(log.period_end).toLocaleString(DateTime.DATE_MED) 
+                : "Present";
 
-            doc.fontSize(12).text(`Date Logged: ${logDate}`);
-            doc.fontSize(14).text(`Symptom: ${log.symptomname} | Severity: ${log.severity}/5`);
-            doc.fontSize(10).fillColor('gray').text(`Associated Period: ${pStart} to ${pEnd}`);
-            doc.fillColor('black').text(`---------------------------------------`);
-            doc.moveDown(0.5);
+            doc.fontSize(10).fillColor('gray').text(`Logged on: ${logDate}`);
+            doc.fontSize(14).fillColor('black').text(`${log.symptomname}`, { continued: true });
+            doc.fontSize(12).text(`  (Severity: ${log.severity}/10)`);
+            
+            doc.fontSize(10).fillColor('#444').text(`Cycle Period: ${pStart} to ${pEnd}`);
+            doc.moveDown(0.2);
+            doc.strokeColor('#eee').moveTo(50, doc.y).lineTo(550, doc.y).stroke();
+            doc.moveDown(0.8);
         });
 
         doc.end();
@@ -413,10 +477,66 @@ app.get("/api/logs/pdf", checkAuth, async (req, res) => {
         console.error("PDF Generation Error:", err);
         res.status(500).send("An error occurred while generating the PDF.");
     }
-}); 
+});
 
 
+app.get('/api/trends', checkAuth, async (req, res) => {
+    try {
+        const userId = req.userId;
+        const currentContext = await getCycleContext(userId); 
 
+        if (!currentContext) {
+            return res.status(200).json({ 
+                has_trend: false, 
+                message: "No active cycle found. Log your period start date to see trends!" 
+            });
+        }
+
+        const { currentDay } = currentContext;
+
+        const trendQuery = `
+            WITH LoggedDays AS (
+                SELECT 
+                    s.symptomname,
+                    (EXTRACT(DAY FROM (s.logged_at - pd.startdate))::int + 1) as cycle_day
+                FROM symptomdecoder s
+                JOIN period pd ON s.userid = pd.userid
+                WHERE s.userid = $1 
+                  AND s.logged_at >= pd.startdate 
+                  AND (pd.enddate IS NULL OR s.logged_at <= pd.enddate + INTERVAL '25 days')
+            )
+            SELECT symptomname, COUNT(*) as frequency
+            FROM LoggedDays
+            WHERE cycle_day = $2
+            GROUP BY symptomname
+            HAVING COUNT(*) >= 2;
+        `;
+
+        const results = await pool.query(trendQuery, [userId, currentDay]);
+
+        if (results.rows.length > 0) {
+            const symptoms = results.rows.map(r => r.symptomname).join(", ");
+            res.json({
+                has_trend: true,
+                current_day: currentDay,
+                phase: currentContext.phase,
+                message: `Heads up! You usually report ${symptoms} around day ${currentDay}.`,
+                suggested_symptoms: results.rows.map(r => r.symptomname)
+            });
+        } else {
+            res.json({
+                has_trend: false,
+                current_day: currentDay,
+                phase: currentContext.phase,
+                message: `You're on day ${currentDay} (${currentContext.phase}). No specific patterns detected yet.`
+            });
+        }
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Could not calculate trends" });
+    }
+});
 
 
 
