@@ -42,194 +42,271 @@ async function getCycleContext(profileId = 3) {
 }
 
 
+// first time logging in
+import { v4 as uuidv4 } from 'uuid';
+app.post("/api/newuser", async (req, res) => {
+    try {
+        const { avgcyclelength} = req.body;
+        const anonymousId = uuidv4(); 
+        const insertUserQuery = `
+            INSERT INTO profiles (id, avgcyclelength) 
+            VALUES ($1, $2)
+        `;
+        await pool.query(insertUserQuery, [anonymousId, avgcyclelength]);
+        
+        res.json({ 
+            message: "Profile created!", 
+            userToken: anonymousId 
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Could not create profile" });
+    }
+});
+
+
+const checkAuth = (req, res, next) => {
+    const token = req.headers['x-user-token'];
+    if (!token) {
+        return res.status(401).json({ error: "No ID found. Please complete onboarding." });
+    }
+    req.userId = token; 
+    next();
+};
+
+
 app.get("/api", (req,res)=> {
     res.send('we working gang')
 })
 
 
 // get your status + current date
-app.get('/api/period', async (req,res)=> {
+// im having a lot of issues with the timezone migth need to use a library for this or sum
+app.get('/api/period', checkAuth, async (req, res) => {
     try {
-        const getPeriodQuery = 'SELECT * FROM profiles WHERE id = 3';
-        const raw = await pool.query(getPeriodQuery);
-        const results = raw.rows[0]
-        const today = new Date();
-        const lastPeriod = new Date(results.lastperiod);
-        const currentDayInMiliSeconds = today - lastPeriod;
-        const daysPast = Math.floor(currentDayInMiliSeconds / (1000 * 60 * 60 * 24));
-        const currentDay = (daysPast % results.avgcyclelength) + 1;
-        let phase;
-        let ovulation;
-        // math to calculate phase 
-        // if period shorter than 20 days we treat it as a short cycle
-        if (results.avgcyclelength < 21) {
-            ovulation = Math.floor(results.avgcyclelength / 2)
-        } else {
-            ovulation = results.avgcyclelength - 14;
+        const getPeriodQuery = `
+            SELECT p.avgcyclelength, pd.startdate 
+            FROM profiles p 
+            JOIN period pd ON p.id = pd.userid 
+            WHERE p.id = $1 AND pd.enddate IS NULL
+            ORDER BY pd.startdate DESC LIMIT 1
+        `;
+        
+        const raw = await pool.query(getPeriodQuery, [req.userId]);
+        
+        if (raw.rows.length === 0) {
+            return res.status(404).json({ error: "No active cycle found (enddate is not null)." });
         }
 
-       if (currentDay <= 5) { 
+        const results = raw.rows[0];
+        const cycleLength = parseInt(results.avgcyclelength) || 28;
+
+        const now = new Date();
+        const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+
+        const startDateObj = new Date(results.startdate);
+        const startUTC = Date.UTC(startDateObj.getUTCFullYear(), startDateObj.getUTCMonth(), startDateObj.getUTCDate());
+
+        const diffInMs = todayUTC - startUTC;
+        const daysPast = Math.floor(diffInMs / (1000 * 60 * 60 * 24));
+
+      
+        const currentDay = ((daysPast % cycleLength) + cycleLength) % cycleLength + 1;
+
+        let phase;
+        const ovulationDay = cycleLength - 14; 
+
+        if (currentDay <= 5) { 
             phase = "Menses";
-        } else if (currentDay < ovulation - 2) {
+        } else if (currentDay < ovulationDay - 2) {
             phase = "Follicular";
-        } else if (currentDay >= ovulation - 2 && currentDay <= ovulation + 1) {
+        } else if (currentDay >= ovulationDay - 2 && currentDay <= ovulationDay + 1) {
             phase = "Ovulation";
         } else {
             phase = "Luteal";
         }
 
+        res.json({ 
+            day_in_cycle: currentDay, 
+            phase: phase 
+        });
 
-        res.json({ "day you are on": currentDay, 
-                    "your phase is: " : phase
-                })
-
-    } catch(err){
-        res.json({error: "an error has ocurrec"})
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Database or Calculation Error" });
     }
-
-})
+});
 
 //symptom logger
 
-app.post("/api/logger", async (req,res)=> {
-
+app.post("/api/logger", checkAuth, async (req, res) => {
     try {
-        const {symptomname, severity} = req.body;
-        if (!symptomname || !severity){
-            return res.json({error: "please enter both symptom name and severity"})
+        const { symptomname, severity } = req.body;
+
+        if (!symptomname || !severity) {
+            return res.status(400).json({ error: "please enter both symptom name and severity" });
         }
-        const logSymptomQuery = "INSERT INTO SYMPTOMDECODER (symptomname, severity) VALUES ($1, $2)"
-        const results = await pool.query(logSymptomQuery, [symptomname, severity])
-        res.json("everything was logged sucesfully")
-    } catch(err){
-        res.json({error: "an error has ocurred"})
+
+        const logSymptomQuery = "INSERT INTO symptomdecoder (userid, symptomname, severity) VALUES ($1, $2, $3) RETURNING *";
+        
+        await pool.query(logSymptomQuery, [req.userId, symptomname, severity]);
+
+        res.json("everything was logged sucesfully");
+    } catch (err) {
+        console.error(err); 
+        res.status(500).json({ error: "an error has ocurred", detail: err.message });
     }
-
-})
-
-
-//new user
-app.post("/api/newuser", async (req,res)=> {
-    try {
-        const {avgcyclelength} = req.body;
-        if (!avgcyclelength) {
-            return res.json({error: "please enter your average cycle length"})
-        }
-        const insertUserQuery = 'INSERT INTO profiles (avgcyclelength) VALUES ($1)';
-        const results = await pool.query(insertUserQuery, [avgcyclelength])
-        res.json("profile succesfully created")
-    } catch(err)  {
-        res.json({error: "an error has ocurred when trying to create profile"})
-    }
-})
-
-
-
+});
 
 //next 6 periods predictor
 // call this endpoint for calendar
-app.get('/api/predictions', async (req, res) => {
+app.get('/api/predictions', checkAuth, async (req, res) => {
     try {
-        const queryToGetInfo = 'SELECT lastperiod, avgcyclelength FROM profiles WHERE id = 3'
-        const results = await pool.query(queryToGetInfo);
-        const { lastperiod, avgcyclelength } = results.rows[0];
+        const queryToGetInfo = `
+            SELECT p.avgcyclelength, pd.startdate 
+            FROM profiles p 
+            JOIN period pd ON p.id = pd.userid 
+            WHERE p.id = $1 AND pd.enddate IS NULL 
+            ORDER BY pd.startdate DESC LIMIT 1;
+        `;
+        
+        const results = await pool.query(queryToGetInfo, [req.userId]);
 
+        if (results.rows.length === 0) {
+            return res.status(404).json({ error: "No active period found to base predictions on." });
+        }
+
+        const { startdate, avgcyclelength } = results.rows[0];
         let predictions = [];
-        let nextDate = new Date(lastperiod);
+        let currentRefDate = new Date(startdate);
 
         for (let i = 0; i < 6; i++) {
-            nextDate.setDate(nextDate.getDate() + avgcyclelength);
-            
+            currentRefDate.setDate(currentRefDate.getDate() + avgcyclelength);
+            let endDate = new Date(currentRefDate);
+            endDate.setDate(endDate.getDate() + 5);
+
             predictions.push({
                 period_number: i + 1,
-                estimated_start: new Date(nextDate).toISOString().split('T')[0],
-                estimated_end: "" // add 4 or 5 days to start date
+                estimated_start: currentRefDate.toISOString().split('T')[0],
+                estimated_end: endDate.toISOString().split('T')[0]
             });
         }
 
         res.json(predictions);
     } catch (err) {
-        res.status(500).json({ error: "Prediction failed" });
-    }
-});
-
-
-// update period info
-// Update the start date when a new period begins
-
-
-// check this route
-app.put("/api/update-period", async (req, res) => {
-    try {
-        const today = new Date().toISOString().split('T')[0]; // Format: YYYY-MM-DD
-
-        const updateQuery = "UPDATE profiles SET lastperiod = $1 WHERE id = 3";
-        await pool.query(updateQuery, [today]);
-
-        res.json({ 
-            message: "Cycle updated Day 1 is now " + today,
-            status: "Success"
-        });
-    } catch (err) {
         console.error(err);
-        res.status(500).json({ error: "Failed to update cycle" });
+        res.status(500).json({ error: "Prediction failed", detail: err.message });
     }
 });
+
+
+
+
+
+
+
 // first period ever 
-// continue working on this, this is for the first time you register
-app.post("/api/first-period", async (req,res)=> {
+app.post("/api/first-period", checkAuth, async (req, res) => {
     try {
+        const { startDate } = req.body; 
 
-    } catch(err){
+    
+        if (!startDate) {
+            return res.status(400).json({ error: "startDate is required" });
+        }
 
+        const insertPeriodQuery = `
+            INSERT INTO period (userid, startdate, enddate) 
+            VALUES ($1, $2, NULL) 
+            RETURNING *
+        `;
+        
+        const result = await pool.query(insertPeriodQuery, [req.userId, startDate]);
+
+        res.json({
+            message: "First period logged successfully",
+            period: result.rows[0]
+        });
+
+    } catch (err) {
+        console.error("Error logging first period:", err.stack);
+        res.status(500).json({ error: "An error occurred", detail: err.message });
     }
-})
+});
 
 
 
 //update new period
-app.post("/api/new-period", async (req, res) => {
+//needs further testing
+app.post("/api/new-period", checkAuth, async (req, res) => {
     const client = await pool.connect(); 
     try {
-        const { startDate } = req.body;
-        const today = startDate || new Date().toISOString().split('T')[0];
+        const { startDate } = req.body; 
+        const todayStr = startDate;
 
         await client.query('BEGIN'); 
 
-        
         const closeQuery = `
             UPDATE period
             SET enddate = $1 
-            WHERE userid = $2 AND end_date IS NULL
+            WHERE userid = $2 AND enddate IS NULL
         `;
-        
-        const yesterday = new Date(new Date(today) - 86400000).toISOString().split('T')[0];
-        await client.query(closeQuery, [yesterday, profileId]);
+        const yesterday = new Date(todayStr);
+        yesterday.setDate(yesterday.getDate() - 1);
+        const yesterdayStr = yesterday.toISOString().split('T')[0];
+        await client.query(closeQuery, [yesterdayStr, req.userId]);
 
-       
         const openQuery = `
-            INSERT INTO periods (userid, startdate, enddate) 
+            INSERT INTO period (userid, startdate, enddate) 
             VALUES ($1, $2, NULL) 
             RETURNING *;
         `;
-        const result = await client.query(openQuery, [profileId, today]);
+        await client.query(openQuery, [req.userId, todayStr]);
+
+        const historyQuery = `
+            SELECT startdate FROM period 
+            WHERE userid = $1 
+            ORDER BY startdate DESC LIMIT 3
+        `;
+        const history = await client.query(historyQuery, [req.userId]);
+
+        if (history.rows.length >= 2) {
+            let totalDays = 0;
+            let count = 0;
+
+            for (let i = 0; i < history.rows.length - 1; i++) {
+                const d1 = new Date(history.rows[i].startdate);
+                const d2 = new Date(history.rows[i + 1].startdate);
+                
+             
+                const diff = Math.round((d1 - d2) / (1000 * 60 * 60 * 24));
+                totalDays += diff;
+                count++;
+            }
+
+            const newAvg = Math.round(totalDays / count);
+
+            await client.query(
+                'UPDATE profiles SET avgcyclelength = $1 WHERE id = $2',
+                [newAvg, req.userId]
+            );
+        }
 
         await client.query('COMMIT'); 
 
         res.json({
-            message: "Successfully closed old cycle and started new one.",
-            newPeriod: result.rows[0]
+            message: "Cycle updated and average recalculated.",
+            newAverage: history.rows.length >= 2 ? "Updated" : "Not enough data yet"
         });
 
     } catch (err) {
         await client.query('ROLLBACK'); 
-        console.error(err);
-        res.status(500).json({ error: "Failed to reset cycle" });
+        console.error("Transaction Error:", err);
+        res.status(500).json({ error: "Failed to update cycle", detail: err.message });
     } finally {
         client.release(); 
     }
 });
-
 // Gemini health assistant 
 app.post('/api/assistant', async (req, res) => {
     try {
@@ -269,10 +346,10 @@ app.post('/api/assistant', async (req, res) => {
 
 
 // past 10 logs
-app.get("/api/logs", async (req, res) => {
+app.get("/api/logs", checkAuth, async (req, res) => {
     try {
-        const query = "SELECT * FROM symptomdecoder WHERE userid = NULL ORDER BY id DESC LIMIT 10";
-        const results = await pool.query(query);
+        const query = "SELECT * FROM symptomdecoder WHERE userid = $1 ORDER BY id DESC LIMIT 10";
+        const results = await pool.query(query, [req.userId]);
         
         res.json(results.rows);
     } catch (err) {
@@ -282,17 +359,33 @@ app.get("/api/logs", async (req, res) => {
 
 
 //get pdf
-
-
-// add timestamp to logs and periods
-// need to store all periods to re calculate all
-
 import PDFDocument from 'pdfkit';
 
-app.get("/api/logs/pdf", async (req, res) => {
+app.get("/api/logs/pdf", checkAuth, async (req, res) => {
     try {
-        const results = await pool.query("SELECT * FROM SYMPTOMDECODER  order by id desc limit 10");
+        const query = `
+            SELECT 
+                s.symptomname, 
+                s.severity, 
+                s.logged_at,
+                (SELECT startdate FROM period 
+                 WHERE userid = $1 AND startdate <= s.logged_at 
+                 ORDER BY startdate DESC LIMIT 1) as period_start,
+                (SELECT enddate FROM period 
+                 WHERE userid = $1 AND startdate <= s.logged_at 
+                 ORDER BY startdate DESC LIMIT 1) as period_end
+            FROM SYMPTOMDECODER s
+            WHERE s.userid = $1 
+            ORDER BY s.logged_at DESC 
+            LIMIT 10
+        `;
         
+        const results = await pool.query(query, [req.userId]);
+
+        if (results.rows.length === 0) {
+            return res.status(404).send("No symptom logs found.");
+        }
+
         const doc = new PDFDocument();
         
         res.setHeader('Content-Type', 'application/pdf');
@@ -300,20 +393,27 @@ app.get("/api/logs/pdf", async (req, res) => {
 
         doc.pipe(res); 
 
-        doc.fontSize(25).text('My Period App: Symptom Report', { align: 'center' });
+        doc.fontSize(20).text('Symptom Log Report', { align: 'center' });
         doc.moveDown();
 
         results.rows.forEach(log => {
-            doc.fontSize(12).text(`Symptom: ${log.symptomname} | Severity: ${log.severity}/5`);
-            doc.text(`---------------------------------------`);
+            const logDate = new Date(log.logged_at).toLocaleDateString();
+            const pStart = log.period_start ? new Date(log.period_start).toLocaleDateString() : "N/A";
+            const pEnd = log.period_end ? new Date(log.period_end).toLocaleDateString() : "Present";
+
+            doc.fontSize(12).text(`Date Logged: ${logDate}`);
+            doc.fontSize(14).text(`Symptom: ${log.symptomname} | Severity: ${log.severity}/5`);
+            doc.fontSize(10).fillColor('gray').text(`Associated Period: ${pStart} to ${pEnd}`);
+            doc.fillColor('black').text(`---------------------------------------`);
+            doc.moveDown(0.5);
         });
 
         doc.end();
     } catch (err) {
-        res.status(500).send("Error generating PDF");
+        console.error("PDF Generation Error:", err);
+        res.status(500).send("An error occurred while generating the PDF.");
     }
-});
-
+}); 
 
 
 
