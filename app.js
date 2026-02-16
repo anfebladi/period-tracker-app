@@ -1,4 +1,5 @@
 
+
 const PORT = 3000;
 import { pool } from "./db.js"
 import express from 'express'
@@ -7,9 +8,21 @@ import { GoogleGenerativeAI } from '@google/generative-ai'
 
 dotenv.config()
 
-const genAI = process.env.GEMINI_API_KEY
-  ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
-  : null;
+
+
+// 1. Initialize genAI normally
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// 2. FORCE 'v1' and use the base model name
+const assistantModel = genAI.getGenerativeModel(
+    { model: "gemini-2.5-flash" }, 
+);
+
+const safetyAuditorModel = genAI.getGenerativeModel(
+    { model: "gemini-2.5-flash" },
+
+)
+
 
 const app = express()
 app.use(express.json())
@@ -351,49 +364,26 @@ app.post("/api/new-period", checkAuth, async (req, res) => {
 // Gemini health assistant 
 app.post('/api/assistant', checkAuth, async (req, res) => {
     try {
-        if (!genAI) {
-            return res.status(503).json({
-                error: 'Health assistant is not configured.',
-            });
-        }
+        if (!assistantModel) return res.status(503).json({ error: 'AI not initialized.' });
 
-        const { message } = req.body; 
-        
-        if (!message || typeof message !== 'string') {
-            return res.status(400).json({ error: 'Please provide a message.' });
-        }
+        const { message } = req.body;
+        if (!message) return res.status(400).json({ error: 'No message provided.' });
 
         const cycleContext = await getCycleContext(req.userId);
-        
         const contextStr = cycleContext
-            ? `The user is on day ${cycleContext.currentDay} of their cycle (phase: ${cycleContext.phase}, average cycle length: ${cycleContext.avgcyclelength} days).`
-            : 'No cycle data is available for this user.';
+            ? `Day ${cycleContext.currentDay} (${cycleContext.phase}).`
+            : 'No cycle data.';
 
-        const systemInstruction = `You are a supportive, respectful health assistant for a period/cycle tracking app. 
-        Current user context: ${contextStr}. 
-        You can discuss cycles, symptoms, wellness, and general health tips. 
-        Always remind users you are not a doctor and they should see a healthcare provider for medical advice. 
-        Be concise and helpful.`;
+        // Call the global model
+        const result = await assistantModel.generateContent(`Context: ${contextStr}\nUser: ${message}`);
+        res.json({ reply: result.response.text() });
 
-        const model = genAI.getGenerativeModel({
-            model: 'gemini-2.0-flash',
-            systemInstruction,
-        });
-
-        const result = await model.generateContent(message.trim());
-        const text = result.response.text();
-
-        if (!text) {
-            return res.status(502).json({ error: 'Assistant did not return a reply.' });
-        }
-
-        res.json({ reply: text });
     } catch (err) {
-        console.error('Assistant error:', err);
-        res.status(500).json({ error: 'The health assistant could not process your message.' });
+        console.error('Assistant Error:', err);
+        const status = err.status || 500;
+        res.status(status).json({ error: err.message || 'AI Error' });
     }
 });
-
 
 // past 10 logs
 app.get("/api/logs", checkAuth, async (req, res) => {
@@ -535,6 +525,90 @@ app.get('/api/trends', checkAuth, async (req, res) => {
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: "Could not calculate trends" });
+    }
+});
+
+
+import axios from 'axios';
+
+import * as cheerio from 'cheerio';
+
+app.post('/api/analyze-product', checkAuth, async (req, res) => {
+    try {
+        const { productUrl } = req.body;
+
+        
+        if (!productUrl || !productUrl.includes('amazon.com')) {
+            return res.status(400).json({ error: 'Please provide a valid Amazon product link.' });
+        }
+
+        
+        const response = await axios.get(productUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Referer': 'https://www.google.com/',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            }
+        });
+
+        
+        const $ = cheerio.load(response.data);
+        const productTitle = $('#productTitle').text().trim();
+        
+        
+        const bulletPoints = $('#feature-bullets ul li').map((i, el) => $(el).text().trim()).get().join(' ');
+        const description = $('#productDescription').text().trim();
+        const ingredients = $('#important-information .content').text().trim();
+
+        const combinedData = `
+            Title: ${productTitle}
+            Details: ${bulletPoints}
+            Description: ${description}
+            Ingredients Section: ${ingredients}
+        `;
+
+        if (!productTitle || combinedData.length < 50) {
+            return res.status(422).json({ 
+                error: 'Could not extract product details.', 
+                message: 'Amazon is blocking the automated scan. You might need to paste the ingredients manually.' 
+            });
+        }
+
+
+        const systemInstruction = `
+            You are a product safety auditor for menstrual health. 
+            Analyze the product text for pads, tampons, or cups. 
+            Check for:
+            - Chlorine bleaching (look for "Totally Chlorine Free" or "TCF").
+            - Synthetic fragrances/perfumes.
+            - Phthalates, Dioxins, or Pesticide residues.
+            - Organic certifications (GOTS).
+            Provide a clear report: 
+            1. Safety Score (1-10)
+            2. Red Flags (Ingredients to avoid)
+            3. Verdict (Safe, Caution, or Avoid).
+        `;
+
+        const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', systemInstruction });
+        const result = await model.generateContent(`Analyze this product: ${combinedData}`);
+        const auditReport = result.response.text();
+
+        res.json({
+            success: true,
+            productName: productTitle,
+            analysis: auditReport
+        });
+
+    } catch (err) {
+        console.error('Scraper Error:', err.message);
+
+        if (err.status === 429) {
+            return res.status(429).json({ error: 'AI is resting. Try again in 1 minute.' });
+        }
+
+        res.status(500).json({ error: 'Failed to analyze product. Amazon may be blocking the request.' });
     }
 });
 
