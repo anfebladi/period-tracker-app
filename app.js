@@ -10,10 +10,9 @@ dotenv.config()
 
 
 
-// 1. Initialize genAI normally
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// 2. FORCE 'v1' and use the base model name
 const assistantModel = genAI.getGenerativeModel(
     { model: "gemini-2.5-flash" }, 
 );
@@ -28,6 +27,49 @@ const app = express()
 app.use(express.json())
 
 import { DateTime } from 'luxon';
+
+function toDateTime(val) {
+    if (!val) return null;
+    if (val instanceof Date) return DateTime.fromJSDate(val);
+    if (typeof val === 'string') return DateTime.fromISO(val);
+    return DateTime.fromJSDate(val);
+}
+
+function getCycleStatusFromDays(daysPast, cycleLength) {
+    const ovulationDay = cycleLength - 14;
+    // Special-case per user request: if avg cycle length is 30 and it's been
+    // 30 or more days since the last start, do not wrap to a new cycle —
+    // show the actual day count and indicate the next period is soon.
+    if (cycleLength === 30 && daysPast >= 30) {
+        return {
+            currentDay: daysPast + 1,
+            phase: 'Next period soon'
+        };
+    }
+
+    if (daysPast >= cycleLength) {
+        // For other cycle lengths, keep existing wrap behavior (treat as new cycle)
+        return {
+            currentDay: ((daysPast % cycleLength) + cycleLength) % cycleLength + 1,
+            phase: 'Next period soon'
+        };
+    }
+
+    const currentDay = ((daysPast % cycleLength) + cycleLength) % cycleLength + 1;
+
+    let phase;
+    if (currentDay <= 5) {
+        phase = 'Menses';
+    } else if (currentDay < ovulationDay - 2) {
+        phase = 'Follicular';
+    } else if (currentDay >= ovulationDay - 2 && currentDay <= ovulationDay + 1) {
+        phase = 'Ovulation';
+    } else {
+        phase = 'Luteal';
+    }
+
+    return { currentDay, phase };
+}
 
 async function getCycleContext(profileId) {
   try {
@@ -47,27 +89,12 @@ async function getCycleContext(profileId) {
     
     
     const today = DateTime.now().startOf('day');
-    const startDate = DateTime.fromJSDate(startdate).startOf('day');
+    const startDate = toDateTime(startdate).startOf('day');
     
     
-    const diff = Math.floor(today.diff(startDate, 'days').days);
-    
-    
-    const currentDay = ((diff % cycleLength) + cycleLength) % cycleLength + 1;
-
-    
-    let phase;
-    const ovulationDay = cycleLength - 14; 
-
-    if (currentDay <= 5) { 
-        phase = "Menses";
-    } else if (currentDay < ovulationDay - 2) {
-        phase = "Follicular";
-    } else if (currentDay >= ovulationDay - 2 && currentDay <= ovulationDay + 1) {
-        phase = "Ovulation";
-    } else {
-        phase = "Luteal";
-    }
+    const daysPast = Math.floor(today.diff(startDate, 'days').days);
+    const cycleStatus = getCycleStatusFromDays(daysPast, cycleLength);
+    const { currentDay, phase } = cycleStatus;
 
     return { currentDay, phase, avgcyclelength: cycleLength };
   } catch (err) {
@@ -137,30 +164,14 @@ app.get('/api/period', checkAuth, async (req, res) => {
         const cycleLength = parseInt(results.avgcyclelength) || 28;
 
     
-        const today = DateTime.now().startOf('day'); 
-
-        
-        const startDate = DateTime.fromJSDate(results.startdate).startOf('day');
-
  
-        const diff = today.diff(startDate, 'days').days;
-        const daysPast = Math.floor(diff);
+            const today = DateTime.now().startOf('day');
+            const startDate = toDateTime(results.startdate).startOf('day');
 
-        
-        const currentDay = ((daysPast % cycleLength) + cycleLength) % cycleLength + 1;
-
-        let phase;
-        const ovulationDay = cycleLength - 14; 
-
-        if (currentDay <= 5) { 
-            phase = "Menses";
-        } else if (currentDay < ovulationDay - 2) {
-            phase = "Follicular";
-        } else if (currentDay >= ovulationDay - 2 && currentDay <= ovulationDay + 1) {
-            phase = "Ovulation";
-        } else {
-            phase = "Luteal";
-        }
+            const diff = today.diff(startDate, 'days').days;
+            const daysPast = Math.floor(diff);
+            const cycleStatus = getCycleStatusFromDays(daysPast, cycleLength);
+            const { currentDay, phase } = cycleStatus;
 
         res.json({ 
             day_in_cycle: currentDay, 
@@ -221,7 +232,7 @@ app.get('/api/predictions', checkAuth, async (req, res) => {
         let predictions = [];
         
     
-        let baseDate = DateTime.fromJSDate(startdate).startOf('day');
+        let baseDate = toDateTime(startdate).startOf('day');
 
         for (let i = 1; i <= 6; i++) {
             
@@ -260,13 +271,18 @@ app.post("/api/first-period", checkAuth, async (req, res) => {
             return res.status(400).json({ error: "startDate is required" });
         }
 
+        // Parse date string (YYYY-MM-DD) as local date to avoid timezone shifts
+        const dateStr = typeof startDate === 'string' ? startDate.split('T')[0] : startDate;
+        const [year, month, day] = dateStr.split('-').map(Number);
+        const localDate = DateTime.local(year, month, day).startOf('day').toISODate();
+
         const insertPeriodQuery = `
             INSERT INTO period (userid, startdate, enddate) 
             VALUES ($1, $2, NULL) 
             RETURNING *
         `;
         
-        const result = await pool.query(insertPeriodQuery, [req.userId, startDate]);
+        const result = await pool.query(insertPeriodQuery, [req.userId, localDate]);
 
         res.json({
             message: "First period logged successfully",
@@ -289,8 +305,10 @@ app.post("/api/new-period", checkAuth, async (req, res) => {
     try {
         const { startDate } = req.body; 
         
-        
-        const startDt = DateTime.fromISO(startDate);
+        // Parse date string (YYYY-MM-DD) as local date to avoid timezone shifts
+        const dateStr = typeof startDate === 'string' ? startDate.split('T')[0] : startDate;
+        const [year, month, day] = dateStr.split('-').map(Number);
+        const startDt = DateTime.local(year, month, day).startOf('day');
         const todayStr = startDt.toISODate(); 
 
         await client.query('BEGIN'); 
@@ -326,8 +344,8 @@ app.post("/api/new-period", checkAuth, async (req, res) => {
 
             for (let i = 0; i < history.rows.length - 1; i++) {
                 
-                const d1 = DateTime.fromJSDate(history.rows[i].startdate);
-                const d2 = DateTime.fromJSDate(history.rows[i + 1].startdate);
+                const d1 = toDateTime(history.rows[i].startdate);
+                const d2 = toDateTime(history.rows[i + 1].startdate);
                 
               
                 const diff = d1.diff(d2, 'days').days;
@@ -577,19 +595,32 @@ app.post('/api/analyze-product', checkAuth, async (req, res) => {
         }
 
 
-        const systemInstruction = `
-            You are a product safety auditor for menstrual health. 
-            Analyze the product text for pads, tampons, or cups. 
-            Check for:
-            - Chlorine bleaching (look for "Totally Chlorine Free" or "TCF").
-            - Synthetic fragrances/perfumes.
-            - Phthalates, Dioxins, or Pesticide residues.
-            - Organic certifications (GOTS).
-            Provide a clear report: 
-            1. Safety Score (1-10)
-            2. Red Flags (Ingredients to avoid)
-            3. Verdict (Safe, Caution, or Avoid).
-        `;
+        const systemInstruction = 
+            `You are a product safety auditor for menstrual health. 
+                Analyze the product text for pads, tampons, or cups. 
+                
+                SCORING LOGIC:
+                Start with a base score of 100. Apply the following deductions:
+                - Fragrance: -25 points
+                - Parfum: -25 points
+                - Phthalates: -35 points
+                - Chlorine bleaching (not TCF): -20 points
+                - Pesticide residues: -20 points
+                
+                Convert the final total to a 1-10 scale (e.g., 75/100 = 7.5/10).
+
+                Check for:
+                - Chlorine bleaching (Look for "Totally Chlorine Free" or "TCF").
+                - Synthetic fragrances/perfumes.
+                - Phthalates, Dioxins, or Pesticide residues.
+                - Organic certifications (e.g., GOTS).
+
+                Provide a clear report: 
+                1. Safety Score (1-10)
+                2. Red Flags (Specific ingredients found that triggered deductions)
+                3. Verdict (Safe for 8-10, Caution for 5-7, Avoid for below 5).`
+                    
+        ;
 
         const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', systemInstruction });
         const result = await model.generateContent(`Analyze this product: ${combinedData}`);
