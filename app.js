@@ -1,6 +1,6 @@
 
 
-const PORT = 3000;
+const PORT = 5000;
 import { pool } from "./db.js"
 import express from 'express'
 import dotenv from 'dotenv'
@@ -595,32 +595,19 @@ app.post('/api/analyze-product', checkAuth, async (req, res) => {
         }
 
 
-        const systemInstruction = 
-            `You are a product safety auditor for menstrual health. 
-                Analyze the product text for pads, tampons, or cups. 
-                
-                SCORING LOGIC:
-                Start with a base score of 100. Apply the following deductions:
-                - Fragrance: -25 points
-                - Parfum: -25 points
-                - Phthalates: -35 points
-                - Chlorine bleaching (not TCF): -20 points
-                - Pesticide residues: -20 points
-                
-                Convert the final total to a 1-10 scale (e.g., 75/100 = 7.5/10).
-
-                Check for:
-                - Chlorine bleaching (Look for "Totally Chlorine Free" or "TCF").
-                - Synthetic fragrances/perfumes.
-                - Phthalates, Dioxins, or Pesticide residues.
-                - Organic certifications (e.g., GOTS).
-
-                Provide a clear report: 
-                1. Safety Score (1-10)
-                2. Red Flags (Specific ingredients found that triggered deductions)
-                3. Verdict (Safe for 8-10, Caution for 5-7, Avoid for below 5).`
-                    
-        ;
+        const systemInstruction = `
+            You are a product safety auditor for menstrual health. 
+            Analyze the product text for pads, tampons, or cups. 
+            Check for:
+            - Chlorine bleaching (look for "Totally Chlorine Free" or "TCF").
+            - Synthetic fragrances/perfumes.
+            - Phthalates, Dioxins, or Pesticide residues.
+            - Organic certifications (GOTS).
+            Provide a clear report: 
+            1. Safety Score (1-10)
+            2. Red Flags (Ingredients to avoid)
+            3. Verdict (Safe, Caution, or Avoid).
+        `;
 
         const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', systemInstruction });
         const result = await model.generateContent(`Analyze this product: ${combinedData}`);
