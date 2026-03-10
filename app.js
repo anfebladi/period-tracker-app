@@ -37,9 +37,7 @@ function toDateTime(val) {
 
 function getCycleStatusFromDays(daysPast, cycleLength) {
     const ovulationDay = cycleLength - 14;
-    // Special-case per user request: if avg cycle length is 30 and it's been
-    // 30 or more days since the last start, do not wrap to a new cycle —
-    // show the actual day count and indicate the next period is soon.
+   
     if (cycleLength === 30 && daysPast >= 30) {
         return {
             currentDay: daysPast + 1,
@@ -48,7 +46,7 @@ function getCycleStatusFromDays(daysPast, cycleLength) {
     }
 
     if (daysPast >= cycleLength) {
-        // For other cycle lengths, keep existing wrap behavior (treat as new cycle)
+       
         return {
             currentDay: ((daysPast % cycleLength) + cycleLength) % cycleLength + 1,
             phase: 'Next period soon'
@@ -103,7 +101,7 @@ async function getCycleContext(profileId) {
   }
 }
 
-// first time logging in
+
 import { v4 as uuidv4 } from 'uuid';
 app.post("/api/newuser", async (req, res) => {
     try {
@@ -140,8 +138,6 @@ app.get("/api", (req,res)=> {
     res.send('we working gang')
 })
 
-
-// get your status + current date
 
 
 app.get('/api/period', checkAuth, async (req, res) => {
@@ -185,7 +181,6 @@ app.get('/api/period', checkAuth, async (req, res) => {
     }
 });
 
-//symptom logger
 
 app.post("/api/logger", checkAuth, async (req, res) => {
     try {
@@ -206,8 +201,6 @@ app.post("/api/logger", checkAuth, async (req, res) => {
     }
 });
 
-//next 6 periods predictor
-// call this endpoint for calendar
 
 
 app.get('/api/predictions', checkAuth, async (req, res) => {
@@ -219,6 +212,8 @@ app.get('/api/predictions', checkAuth, async (req, res) => {
             WHERE p.id = $1 AND pd.enddate IS NULL 
             ORDER BY pd.startdate DESC LIMIT 1;
         `;
+
+        
         
         const results = await pool.query(queryToGetInfo, [req.userId]);
 
@@ -261,7 +256,6 @@ app.get('/api/predictions', checkAuth, async (req, res) => {
 
 
 
-// first period ever 
 app.post("/api/first-period", checkAuth, async (req, res) => {
     try {
         const { startDate } = req.body; 
@@ -271,7 +265,6 @@ app.post("/api/first-period", checkAuth, async (req, res) => {
             return res.status(400).json({ error: "startDate is required" });
         }
 
-        // Parse date string (YYYY-MM-DD) as local date to avoid timezone shifts
         const dateStr = typeof startDate === 'string' ? startDate.split('T')[0] : startDate;
         const [year, month, day] = dateStr.split('-').map(Number);
         const localDate = DateTime.local(year, month, day).startOf('day').toISODate();
@@ -297,15 +290,12 @@ app.post("/api/first-period", checkAuth, async (req, res) => {
 
 
 
-//update new period
-//needs further testing
-
 app.post("/api/new-period", checkAuth, async (req, res) => {
     const client = await pool.connect(); 
     try {
         const { startDate } = req.body; 
         
-        // Parse date string (YYYY-MM-DD) as local date to avoid timezone shifts
+        
         const dateStr = typeof startDate === 'string' ? startDate.split('T')[0] : startDate;
         const [year, month, day] = dateStr.split('-').map(Number);
         const startDt = DateTime.local(year, month, day).startOf('day');
@@ -377,9 +367,7 @@ app.post("/api/new-period", checkAuth, async (req, res) => {
     }
 });
 
-//dont know if works yet 
-// api hit the rate limit 
-// Gemini health assistant 
+
 app.post('/api/assistant', checkAuth, async (req, res) => {
     try {
         if (!assistantModel) return res.status(503).json({ error: 'AI not initialized.' });
@@ -547,88 +535,7 @@ app.get('/api/trends', checkAuth, async (req, res) => {
 });
 
 
-import axios from 'axios';
 
-import * as cheerio from 'cheerio';
-
-app.post('/api/analyze-product', checkAuth, async (req, res) => {
-    try {
-        const { productUrl } = req.body;
-
-        
-        if (!productUrl || !productUrl.includes('amazon.com')) {
-            return res.status(400).json({ error: 'Please provide a valid Amazon product link.' });
-        }
-
-        
-        const response = await axios.get(productUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Referer': 'https://www.google.com/',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            }
-        });
-
-        
-        const $ = cheerio.load(response.data);
-        const productTitle = $('#productTitle').text().trim();
-        
-        
-        const bulletPoints = $('#feature-bullets ul li').map((i, el) => $(el).text().trim()).get().join(' ');
-        const description = $('#productDescription').text().trim();
-        const ingredients = $('#important-information .content').text().trim();
-
-        const combinedData = `
-            Title: ${productTitle}
-            Details: ${bulletPoints}
-            Description: ${description}
-            Ingredients Section: ${ingredients}
-        `;
-
-        if (!productTitle || combinedData.length < 50) {
-            return res.status(422).json({ 
-                error: 'Could not extract product details.', 
-                message: 'Amazon is blocking the automated scan. You might need to paste the ingredients manually.' 
-            });
-        }
-
-
-        const systemInstruction = `
-            You are a product safety auditor for menstrual health. 
-            Analyze the product text for pads, tampons, or cups. 
-            Check for:
-            - Chlorine bleaching (look for "Totally Chlorine Free" or "TCF").
-            - Synthetic fragrances/perfumes.
-            - Phthalates, Dioxins, or Pesticide residues.
-            - Organic certifications (GOTS).
-            Provide a clear report: 
-            1. Safety Score (1-10)
-            2. Red Flags (Ingredients to avoid)
-            3. Verdict (Safe, Caution, or Avoid).
-        `;
-
-        const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', systemInstruction });
-        const result = await model.generateContent(`Analyze this product: ${combinedData}`);
-        const auditReport = result.response.text();
-
-        res.json({
-            success: true,
-            productName: productTitle,
-            analysis: auditReport
-        });
-
-    } catch (err) {
-        console.error('Scraper Error:', err.message);
-
-        if (err.status === 429) {
-            return res.status(429).json({ error: 'AI is resting. Try again in 1 minute.' });
-        }
-
-        res.status(500).json({ error: 'Failed to analyze product. Amazon may be blocking the request.' });
-    }
-});
 
 
 
